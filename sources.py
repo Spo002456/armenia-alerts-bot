@@ -153,64 +153,126 @@ def fetch_state_dept(country_tag: str = "AM") -> list[Item]:
 
 
 # --------------------------------------------------------------------------
-# 2. U.S. Embassy Yerevan — Alerts (WordPress RSS, HTML fallback)
+# 2. U.S. Embassy Yerevan — Alerts
+#    The site blocks unknown bots, so we look like a normal browser and try
+#    three entry points: RSS feed -> WordPress JSON API -> HTML page.
 # --------------------------------------------------------------------------
+BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "application/rss+xml,application/json;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,hy;q=0.8",
+    "Referer": "https://am.usembassy.gov/",
+}
+EMBASSY_API = "https://am.usembassy.gov/wp-json/wp/v2"
+
+
+def _embassy_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(BROWSER_HEADERS)
+    return s
+
+
+def _embassy_item(uid, title, date, link, body_html) -> Item:
+    return Item(
+        source="embassy",
+        source_name="U.S. Embassy Yerevan — Alert",
+        source_icon="🏛",
+        uid=uid or link,
+        title=html_to_text(title).strip(),
+        date=date,
+        date_kind="published",
+        url=link,
+        text=html_to_text(body_html),
+        images=extract_images(body_html, link),
+    )
+
+
+def _embassy_from_feed(s: requests.Session, limit: int) -> list[Item]:
+    r = s.get(EMBASSY_FEED, timeout=TIMEOUT)
+    r.raise_for_status()
+    feed = feedparser.parse(r.content)
+    if not feed.entries:
+        raise RuntimeError("feed has no entries")
+    items = []
+    for e in feed.entries[:limit]:
+        body = e.content[0].get("value", "") if e.get("content") else ""
+        body = body or e.get("summary", "")
+        link = e.get("link", EMBASSY_PAGE)
+        it = _embassy_item(e.get("id"), e.get("title", ""), e.get("published", ""),
+                           link, body)
+        it.images = feed_images(e, link, body)
+        items.append(it)
+    return items
+
+
+def _embassy_from_api(s: requests.Session, limit: int) -> list[Item]:
+    r = s.get(f"{EMBASSY_API}/categories", params={"slug": "alert"}, timeout=TIMEOUT)
+    r.raise_for_status()
+    cats = r.json()
+    if not cats:
+        raise RuntimeError("category 'alert' not found")
+    r = s.get(f"{EMBASSY_API}/posts", timeout=TIMEOUT,
+              params={"categories": cats[0]["id"], "per_page": limit, "_embed": 1})
+    r.raise_for_status()
+    items = []
+    for p in r.json():
+        body = p.get("content", {}).get("rendered", "")
+        it = _embassy_item(p.get("guid", {}).get("rendered") or p.get("link"),
+                           p.get("title", {}).get("rendered", ""),
+                           p.get("date_gmt", "") + ("Z" if p.get("date_gmt") else ""),
+                           p.get("link", EMBASSY_PAGE), body)
+        media = (p.get("_embedded", {}).get("wp:featuredmedia") or [{}])[0]
+        if media.get("source_url") and not _SKIP_IMG.search(media["source_url"]):
+            it.images = [media["source_url"]] + [i for i in it.images
+                                                 if i != media["source_url"]]
+        items.append(it)
+    if not items:
+        raise RuntimeError("API returned no posts")
+    return items
+
+
+def _embassy_from_html(s: requests.Session, limit: int) -> list[Item]:
+    r = s.get(EMBASSY_PAGE, timeout=TIMEOUT)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    links = []
+    for a in soup.select("h2 a, h3 a, .entry-title a"):
+        href = a.get("href", "")
+        if href.startswith("https://am.usembassy.gov/") and href not in links:
+            links.append(href)
+    if not links:
+        raise RuntimeError("no alert links on page")
+    items = []
+    for href in links[:limit]:
+        pr = s.get(href, timeout=TIMEOUT)
+        pr.raise_for_status()
+        page = BeautifulSoup(pr.text, "html.parser")
+        title = page.find("h1")
+        body = page.select_one(".entry-content, article")
+        meta = page.find("meta", attrs={"property": "article:published_time"})
+        tm = page.find("time")
+        date = (meta.get("content") if meta else "") or \
+               (tm.get("datetime") if tm and tm.get("datetime") else "")
+        items.append(_embassy_item(href, title.get_text(strip=True) if title else href,
+                                   date, href, str(body) if body else ""))
+    return items
+
+
 def fetch_embassy(limit: int = 5) -> list[Item]:
-    try:
-        feed = feedparser.parse(_get(EMBASSY_FEED).content)
-        entries = feed.entries[:limit]
-        if not entries:
-            raise RuntimeError("empty feed")
-        items = []
-        for e in entries:
-            body = e.content[0].get("value", "") if e.get("content") else ""
-            body = body or e.get("summary", "")
-            link = e.get("link", EMBASSY_PAGE)
-            items.append(Item(
-                source="embassy",
-                source_name="U.S. Embassy Yerevan — Alert",
-                source_icon="🏛",
-                uid=e.get("id") or link,
-                title=e.get("title", "").strip(),
-                date=e.get("published", ""),
-                date_kind="published",
-                url=link,
-                text=html_to_text(body),
-                images=feed_images(e, link, body),
-            ))
-        return items
-    except Exception as feed_error:  # fall back to the category page
-        soup = BeautifulSoup(_get(EMBASSY_PAGE).text, "html.parser")
-        links = []
-        for a in soup.select("h2 a, h3 a, .entry-title a"):
-            href = a.get("href", "")
-            if href.startswith("https://am.usembassy.gov/") and href not in links:
-                links.append(href)
-        if not links:
-            raise RuntimeError(f"Embassy feed and page both failed: {feed_error}")
-        items = []
-        for href in links[:limit]:
-            page = BeautifulSoup(_get(href).text, "html.parser")
-            title = page.find("h1")
-            body = page.select_one(".entry-content, article")
-            meta = page.find("meta", attrs={"property": "article:published_time"})
-            tm = page.find("time")
-            date = (meta.get("content") if meta else "") or \
-                   (tm.get("datetime") if tm and tm.get("datetime") else "")
-            body_html = str(body) if body else ""
-            items.append(Item(
-                source="embassy",
-                source_name="U.S. Embassy Yerevan — Alert",
-                source_icon="🏛",
-                uid=href,
-                title=title.get_text(strip=True) if title else href,
-                date=date,
-                date_kind="published",
-                url=href,
-                text=html_to_text(body_html),
-                images=extract_images(body_html, href),
-            ))
-        return items
+    s = _embassy_session()
+    errors = []
+    for name, fn in (("rss", _embassy_from_feed), ("wp-json", _embassy_from_api),
+                     ("html", _embassy_from_html)):
+        try:
+            items = fn(s, limit)
+            print(f"[embassy] {name}: OK ({len(items)} alerts)")
+            return items
+        except Exception as ex:
+            print(f"[embassy] {name}: FAILED - {type(ex).__name__}: {ex}")
+            errors.append(f"{name}: {ex}")
+    raise RuntimeError("all embassy methods failed -> " + " | ".join(errors))
 
 
 # --------------------------------------------------------------------------
