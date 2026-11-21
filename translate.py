@@ -1,16 +1,22 @@
 """English -> Armenian translation of the full text (no length limit).
 
+Tries several translators in order, with retries, until one works:
+  1. Claude API          (only if ANTHROPIC_API_KEY is set; best quality)
+  2. Google (gtx API)    free, no key
+  3. deep-translator     free Google web endpoint
+  4. MyMemory            free, small daily quota (last resort)
 Long texts are split into paragraph groups and translated piece by piece.
-Uses the Claude API when ANTHROPIC_API_KEY is set (better quality, keeps
-place names and phone numbers intact); otherwise falls back to the free
-Google Translate endpoint via deep-translator.
 """
 from __future__ import annotations
 
 import os
 import sys
+import time
 
 import requests
+
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) ArmeniaAlertsBot/1.0"}
+FAILED = "(Թարգմանությունը հասանելի չէ — տե՛ս անգլերեն բնօրինակը)"
 
 PROMPT = (
     "Translate the following official travel-safety notice from English into "
@@ -20,6 +26,10 @@ PROMPT = (
     "Armenian form (e.g. Syunik -> Սյունիք, Kapan -> Կապան). "
     "Output only the translation.\n\n"
 )
+
+
+def log(msg: str) -> None:
+    print(f"[translate] {msg}", file=sys.stderr, flush=True)
 
 
 def split_paragraphs(text: str, limit: int) -> list[str]:
@@ -44,11 +54,12 @@ def split_paragraphs(text: str, limit: int) -> list[str]:
     return [c.rstrip("\n") for c in chunks]
 
 
-def _claude(text: str, key: str) -> str:
+# --------------------------------------------------------------------------- engines
+def _claude(text: str) -> str:
     r = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
-            "x-api-key": key,
+            "x-api-key": os.environ["ANTHROPIC_API_KEY"],
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         },
@@ -63,31 +74,70 @@ def _claude(text: str, key: str) -> str:
     return "".join(b.get("text", "") for b in r.json()["content"]).strip()
 
 
-def _google(text: str) -> str:
-    from deep_translator import GoogleTranslator
+def _google_gtx(text: str) -> str:
+    r = requests.get(
+        "https://translate.googleapis.com/translate_a/single",
+        params={"client": "gtx", "sl": "en", "tl": "hy", "dt": "t", "q": text},
+        headers=UA,
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+    out = "".join(seg[0] for seg in (data[0] or []) if seg and seg[0])
+    if not out.strip():
+        raise RuntimeError("empty response")
+    return out.strip()
 
-    tr = GoogleTranslator(source="en", target="hy")
-    return (tr.translate(text) or "").strip()
+
+def _deep_google(text: str) -> str:
+    from deep_translator import GoogleTranslator
+    out = GoogleTranslator(source="en", target="hy").translate(text)
+    if not out or not out.strip():
+        raise RuntimeError("empty response")
+    return out.strip()
+
+
+def _mymemory(text: str) -> str:
+    from deep_translator import MyMemoryTranslator
+    tr = MyMemoryTranslator(source="en-GB", target="hy-AM")
+    return "\n".join((tr.translate(p) or "") for p in split_paragraphs(text, 450)).strip()
+
+
+ENGINES = [  # (name, function, chunk size)
+    ("claude", _claude, 3000),
+    ("google-gtx", _google_gtx, 1500),
+    ("deep-translator", _deep_google, 4500),
+    ("mymemory", _mymemory, 4000),
+]
+
+
+def _with_retries(name: str, fn, text: str, tries: int = 3) -> str:
+    last = None
+    for attempt in range(1, tries + 1):
+        try:
+            return fn(text)
+        except Exception as ex:
+            last = ex
+            log(f"{name} attempt {attempt}/{tries} failed: {type(ex).__name__}: {ex}")
+            time.sleep(2 * attempt)
+    raise RuntimeError(f"{name} failed: {last}")
 
 
 def to_armenian(text: str) -> str:
     if not text.strip():
         return ""
-    key = os.getenv("ANTHROPIC_API_KEY")
-    use_claude = bool(key)
-    out = []
-    for chunk in split_paragraphs(text, 3000 if use_claude else 4500):
-        translated = None
-        if use_claude:
-            try:
-                translated = _claude(chunk, key)
-            except Exception as e:
-                print(f"[translate] Claude API failed, using Google: {e}", file=sys.stderr)
-        if translated is None:
-            try:
-                translated = _google(chunk)
-            except Exception as e:
-                print(f"[translate] Google failed: {e}", file=sys.stderr)
-                return "(Թարգմանությունը հասանելի չէ — տե՛ս անգլերեն բնօրինակը)"
-        out.append(translated)
-    return "\n".join(out)
+    for name, fn, size in ENGINES:
+        if name == "claude" and not os.getenv("ANTHROPIC_API_KEY"):
+            continue
+        try:
+            parts = [_with_retries(name, fn, chunk) for chunk in split_paragraphs(text, size)]
+            log(f"translated with {name}")
+            return "\n".join(parts)
+        except Exception as ex:
+            log(f"switching engine: {ex}")
+    log("ALL translation engines failed")
+    return FAILED
+
+
+if __name__ == "__main__":   # quick manual test:  python translate.py
+    print(to_armenian("Exercise increased caution in Armenia.\n• Avoid demonstrations."))
